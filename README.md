@@ -2,19 +2,21 @@
 
 **Ansh Patel** — [github.com/anshcpatel11](https://github.com/anshcpatel11)
 
+**[Live Demo](https://anshcpatel11-stroke-risk-predictor.streamlit.app)**
+
 End-to-end machine learning project predicting stroke risk from patient health records, with a deployed interactive Streamlit application. The model accepts patient demographics and clinical measurements and returns a calibrated stroke probability with a Low / Moderate / High risk tier.
 
 ---
 
 ## Live App
 
+**[Try it here →](https://anshcpatel11-stroke-risk-predictor.streamlit.app)**
+
+Or run locally:
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
-
-The app trains the model at startup (~30 seconds on first load) and caches it for instant predictions.
-
 ---
 
 ## Problem
