@@ -1,10 +1,19 @@
 """
-train.py — Train the stroke risk prediction pipeline and save to model/stroke_pipeline.pkl
+train.py — Train the stroke risk prediction pipeline with MLflow experiment tracking.
+
+Logs 4 runs under the "stroke-risk-prediction" experiment: the 3 base learners
+(Logistic Regression, Random Forest, HistGradientBoosting) evaluated individually,
+plus the final Stacking Ensemble — so you can compare them side-by-side in the
+MLflow UI instead of only reading a static results table.
 
 Usage:
     python train.py
     python train.py --data data/healthcare-dataset-stroke-data.csv
-    python train.py --data data/healthcare-dataset-stroke-data.csv --model-out model/stroke_pipeline.pkl
+    python train.py --model-out model/stroke_pipeline.pkl
+
+View results after running:
+    mlflow ui
+    # then open http://127.0.0.1:5000 in a browser
 """
 
 import argparse
@@ -13,6 +22,8 @@ import pickle
 import warnings
 import numpy as np
 import pandas as pd
+import mlflow
+import mlflow.sklearn
 
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier, StackingClassifier
@@ -26,6 +37,7 @@ from sklearn.utils import resample
 
 warnings.filterwarnings("ignore")
 RANDOM_STATE = 42
+EXPERIMENT_NAME = "stroke-risk-prediction"
 
 
 # ── Feature Engineering ───────────────────────────────────────────────────────
@@ -100,35 +112,61 @@ def build_preprocessor():
     return preprocessor
 
 
-# ── Model ─────────────────────────────────────────────────────────────────────
+# ── Candidate models ──────────────────────────────────────────────────────────
+# Each entry: (friendly run name, model instance, params dict to log to MLflow)
 
-def build_stacking_model():
-    base_estimators = [
-        ("lr", LogisticRegression(
-            max_iter=2000, class_weight="balanced", random_state=RANDOM_STATE
-        )),
-        ("rf", RandomForestClassifier(
-            n_estimators=300, max_depth=8, min_samples_leaf=5,
-            class_weight="balanced", random_state=RANDOM_STATE, n_jobs=-1
-        )),
-        ("hgb", HistGradientBoostingClassifier(
-            max_iter=200, max_depth=6, learning_rate=0.05,
-            class_weight="balanced", random_state=RANDOM_STATE
-        )),
-    ]
-    meta_learner = LogisticRegression(
-        max_iter=2000, class_weight="balanced", random_state=RANDOM_STATE
+def build_candidates():
+    candidates = {}
+
+    lr_params = dict(max_iter=2000, class_weight="balanced", random_state=RANDOM_STATE)
+    candidates["logistic_regression"] = (
+        LogisticRegression(**lr_params), {"model_type": "LogisticRegression", **lr_params}
     )
-    return StackingClassifier(
+
+    rf_params = dict(
+        n_estimators=300, max_depth=8, min_samples_leaf=5,
+        class_weight="balanced", random_state=RANDOM_STATE, n_jobs=-1
+    )
+    candidates["random_forest"] = (
+        RandomForestClassifier(**rf_params), {"model_type": "RandomForestClassifier", **rf_params}
+    )
+
+    hgb_params = dict(
+        max_iter=200, max_depth=6, learning_rate=0.05,
+        class_weight="balanced", random_state=RANDOM_STATE
+    )
+    candidates["hist_gradient_boosting"] = (
+        HistGradientBoostingClassifier(**hgb_params),
+        {"model_type": "HistGradientBoostingClassifier", **hgb_params}
+    )
+
+    # Stacking ensemble reuses the same base estimators + a fresh LR meta-learner
+    base_estimators = [
+        ("lr", LogisticRegression(**lr_params)),
+        ("rf", RandomForestClassifier(**rf_params)),
+        ("hgb", HistGradientBoostingClassifier(**hgb_params)),
+    ]
+    meta_learner = LogisticRegression(max_iter=2000, class_weight="balanced", random_state=RANDOM_STATE)
+    stacking_model = StackingClassifier(
         estimators=base_estimators,
         final_estimator=meta_learner,
         cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE),
         passthrough=False,
         n_jobs=-1
     )
+    candidates["stacking_ensemble"] = (
+        stacking_model,
+        {
+            "model_type": "StackingClassifier",
+            "base_estimators": "lr+rf+hgb",
+            "meta_learner": "LogisticRegression",
+            "cv_folds": 5,
+        }
+    )
+    return candidates
 
 
-# ── Training ──────────────────────────────────────────────────────────────────
+# ── Training helpers ──────────────────────────────────────────────────────────
 
 def load_and_prepare(data_path):
     df = pd.read_csv(data_path)
@@ -155,11 +193,11 @@ def oversample_training(X_proc, y):
 
 def evaluate(y_true, y_pred, y_proba):
     return {
-        "Accuracy":  round(accuracy_score(y_true, y_pred), 4),
-        "Precision": round(precision_score(y_true, y_pred, zero_division=0), 4),
-        "Recall":    round(recall_score(y_true, y_pred, zero_division=0), 4),
-        "F1":        round(f1_score(y_true, y_pred, zero_division=0), 4),
-        "ROC-AUC":   round(roc_auc_score(y_true, y_proba), 4),
+        "accuracy":  round(accuracy_score(y_true, y_pred), 4),
+        "precision": round(precision_score(y_true, y_pred, zero_division=0), 4),
+        "recall":    round(recall_score(y_true, y_pred, zero_division=0), 4),
+        "f1":        round(f1_score(y_true, y_pred, zero_division=0), 4),
+        "roc_auc":   round(roc_auc_score(y_true, y_proba), 4),
     }
 
 
@@ -169,6 +207,49 @@ def find_best_threshold(y_true, y_proba):
     return float(thresholds[np.argmax(f1s)]), float(max(f1s))
 
 
+def run_and_log(run_name, model, params, preprocessor,
+                 X_train_bal, y_train_bal, X_test_proc, y_test):
+    """Fit one candidate model, log params/metrics/model to MLflow, return metrics."""
+    with mlflow.start_run(run_name=run_name):
+        mlflow.set_tag("model_family", params.get("model_type", run_name))
+        mlflow.log_params(params)
+        mlflow.log_param("oversample_ratio", "1:4")
+        mlflow.log_param("n_train_samples_balanced", len(y_train_bal))
+
+        model.fit(X_train_bal, y_train_bal)
+
+        y_pred = model.predict(X_test_proc)
+        y_proba = model.predict_proba(X_test_proc)[:, 1]
+        metrics = evaluate(y_test, y_pred, y_proba)
+        for k, v in metrics.items():
+            mlflow.log_metric(k, v)
+
+        best_thresh, best_f1 = find_best_threshold(np.array(y_test), y_proba)
+        y_pred_opt = (y_proba >= best_thresh).astype(int)
+        metrics_opt = evaluate(y_test, y_pred_opt, y_proba)
+        mlflow.log_metric("optimal_threshold", best_thresh)
+        for k, v in metrics_opt.items():
+            mlflow.log_metric(f"opt_{k}", v)
+
+        # Log a deployable pipeline (preprocessor + fitted model) as one MLflow model,
+        # so it can be reloaded and used for inference without re-fitting anything.
+        inference_pipeline = Pipeline([
+            ("preprocessor", preprocessor),
+            ("model", model),
+        ])
+        mlflow.sklearn.log_model(
+            inference_pipeline,
+            artifact_path="model",
+            registered_model_name=None,  # set to a string to auto-register in Model Registry
+            serialization_format="cloudpickle",  # MLflow 3.x defaults to skops, which rejects tree models
+        )
+
+        print(f"  [{run_name}] default: {metrics}  |  opt@{best_thresh:.3f}: {metrics_opt}")
+        return metrics, metrics_opt, best_thresh
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", default="data/healthcare-dataset-stroke-data.csv")
@@ -176,8 +257,10 @@ def main():
     args = parser.parse_args()
 
     print("\n" + "─" * 60)
-    print("  Stroke Risk Prediction — Training Pipeline")
+    print("  Stroke Risk Prediction — Training Pipeline (MLflow-tracked)")
     print("─" * 60)
+
+    mlflow.set_experiment(EXPERIMENT_NAME)
 
     # Load
     print("\nLoading data...")
@@ -199,48 +282,45 @@ def main():
     # Oversample
     print("\nOversampling training set...")
     X_train_bal, y_train_bal = oversample_training(X_train_proc, y_train)
-    pos_rate = y_train_bal.mean()
-    print(f"  Balanced shape: {X_train_bal.shape} | Positive rate: {pos_rate:.1%}")
+    print(f"  Balanced shape: {X_train_bal.shape} | Positive rate: {y_train_bal.mean():.1%}")
 
-    # Train stacking model
-    print("\nTraining stacking ensemble (LR + RF + HGB → LR meta)...")
-    model = build_stacking_model()
-    model.fit(X_train_bal, y_train_bal)
+    # Train + log every candidate under one experiment
+    print(f"\nTraining candidates and logging to MLflow experiment '{EXPERIMENT_NAME}'...")
+    candidates = build_candidates()
+    results = {}
+    for run_name, (model, params) in candidates.items():
+        metrics, metrics_opt, best_thresh = run_and_log(
+            run_name, model, params, preprocessor,
+            X_train_bal, y_train_bal, X_test_proc, y_test
+        )
+        results[run_name] = {
+            "model": model, "metrics": metrics,
+            "metrics_opt": metrics_opt, "threshold": best_thresh
+        }
 
-    # Evaluate
-    y_pred  = model.predict(X_test_proc)
-    y_proba = model.predict_proba(X_test_proc)[:, 1]
-    metrics = evaluate(y_test, y_pred, y_proba)
-
+    # Print a comparison table (mirrors what you'll see in the MLflow UI)
     print("\n" + "─" * 60)
-    print("  Hold-out Test Set Results (default threshold 0.5)")
+    print("  Comparison — Default Threshold (0.5)")
     print("─" * 60)
-    for k, v in metrics.items():
-        print(f"  {k:<12} {v}")
+    print(f"  {'Model':<26}{'Acc':<8}{'Prec':<8}{'Recall':<8}{'F1':<8}{'ROC-AUC':<8}")
+    for name, r in results.items():
+        m = r["metrics"]
+        print(f"  {name:<26}{m['accuracy']:<8}{m['precision']:<8}{m['recall']:<8}{m['f1']:<8}{m['roc_auc']:<8}")
 
-    # Threshold optimization
-    best_thresh, best_f1 = find_best_threshold(np.array(y_test), y_proba)
-    y_pred_opt = (y_proba >= best_thresh).astype(int)
-    metrics_opt = evaluate(y_test, y_pred_opt, y_proba)
-
-    print(f"\n  Optimal threshold: {best_thresh:.3f}")
-    print("─" * 60)
-    print("  Results at Optimal Threshold")
-    print("─" * 60)
-    for k, v in metrics_opt.items():
-        print(f"  {k:<12} {v}")
-
-    # Save full pipeline (preprocessor + model + threshold)
+    # Save the stacking ensemble as the production pickle bundle (unchanged behavior
+    # for the existing Streamlit app / app.py, which expects this exact structure)
+    best = results["stacking_ensemble"]
     pipeline_bundle = {
         "preprocessor": preprocessor,
-        "model": model,
-        "threshold": best_thresh,
+        "model": best["model"],
+        "threshold": best["threshold"],
         "feature_names": list(X.columns),
     }
     os.makedirs(os.path.dirname(args.model_out), exist_ok=True)
     with open(args.model_out, "wb") as f:
         pickle.dump(pipeline_bundle, f)
-    print(f"\n  Model saved to: {args.model_out}")
+    print(f"\n  Production model (stacking ensemble) saved to: {args.model_out}")
+    print(f"  Run `mlflow ui` and open http://127.0.0.1:5000 to compare all 4 runs.")
     print("─" * 60 + "\n")
 
 

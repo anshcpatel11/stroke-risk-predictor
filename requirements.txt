@@ -5,3 +5,4 @@ matplotlib>=3.7
 seaborn>=0.13
 streamlit>=1.30
 jupyter
+mlflow>=2.14
