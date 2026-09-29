@@ -6,3 +6,4 @@ __pycache__/
 model/stroke_pipeline.pkl
 mlruns/
 mlartifacts/
+mlflow.db
